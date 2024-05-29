@@ -1,0 +1,479 @@
+---
+title: "Data analysis of CSF proteomics"
+author: "Matthijs de Geus"
+output:
+  html_document:
+    toc: yes
+    toc_float: yes
+    code_folding: show
+  '': default
+---
+
+# Load dependencies and datasets
+```{r}
+library(tidyverse)
+library(caret)
+library(ranger)
+library(tidymodels)
+library(gplots)
+library(UpSetR)
+library(cowplot)
+library(ComplexHeatmap)
+library(rpart.plot)
+library(pROC)
+
+protein_data_DEM_Apos <- read.csv("protein_data.csv")
+```
+
+
+# Linear regression modeling
+```{r}
+to_linearmodels <- protein_data_DEM_Apos 
+
+to_linearmodels$Pathology_group <- factor(to_linearmodels$Pathology_group, levels = c("CU","AD","NPH"))
+lm_1 <- lm(as.matrix(to_linearmodels[,6:ncol(to_linearmodels)]) ~ Pathology_group + Age + Gender_binary, data = to_linearmodels)
+to_linearmodels$Pathology_group <- factor(to_linearmodels$Pathology_group, levels = c("AD","NPH"))
+lm_2 <- lm(as.matrix(to_linearmodels[,6:ncol(to_linearmodels)]) ~ Pathology_group + Age + Gender_binary, data = to_linearmodels) 
+
+tidy_lm1 <- broom::tidy(lm_1) %>%
+  filter(term != "(Intercept)") %>%
+  mutate(versus = "CU")
+tidy_lm2 <- broom::tidy(lm_2) %>%
+  filter(term != "(Intercept)") %>%
+  mutate(versus = "AD")
+
+tidy_res <- rbind(tidy_lm1, tidy_lm2) %>%
+  rename("Protein" = response) %>%
+  mutate(term = gsub("Pathology_group", "", term)) %>%
+  arrange(p.value)
+
+Dx_res <- tidy_res %>%
+  filter(term == "CU" | term == "AD" | term == "NPH") %>%
+  mutate(padj = p.adjust(p.value, method = "BH")) 
+
+Dx_res_sig <- Dx_res %>%
+  filter(padj <= 0.05) %>%
+  unite("Contrast", c(term, versus), remove = FALSE) 
+
+Dx_res_GSEA <- Dx_res %>%
+  unite("Contrast", c(term, versus), remove = FALSE) %>%
+  separate(Protein, into = c("Protein Name", "Uniprot_ID"), remove = FALSE, sep ="_") %>%
+  separate(Uniprot_ID, into = c("Uniprot_ID"), sep = "\\.")
+lm_GSEA_AD_CU <- Dx_res_GSEA %>% filter(Contrast == "AD_CU")
+lm_GSEA_NPH_AD <- Dx_res_GSEA %>% filter(Contrast == "NPH_AD")
+lm_GSEA_NPH_CU <- Dx_res_GSEA %>% filter(Contrast == "NPH_CU")
+```
+
+### Upset plot for linear model output
+```{r}
+lm_upset_data <- Dx_res_sig %>%
+  unite("Contrast", term, versus, sep = " vs ", remove = FALSE)
+AD_NPH_lm_sig <- lm_upset_data %>% filter(Contrast == "NPH vs AD")
+CU_NPH_lm_sig <- lm_upset_data %>% filter(Contrast == "NPH vs CU")
+CU_AD_lm_sig <- lm_upset_data %>% filter(Contrast == "AD vs CU")
+
+
+lm_upset <- data.frame(Protein = c(unique(lm_upset_data$Protein))) %>%
+  mutate(`CU vs AD` = ifelse(Protein %in% CU_AD_lm_sig$Protein, 1, 0)) %>%
+  mutate(`CU vs NPH` = ifelse(Protein %in% CU_NPH_lm_sig$Protein, 1, 0)) %>%
+  mutate(`AD vs NPH` = ifelse(Protein %in% AD_NPH_lm_sig$Protein, 1, 0)) %>%
+  mutate(Sums = rowSums(.[2:4]))
+
+upset(lm_upset, 
+      order.by = "freq",
+      matrix.color = "grey20",
+      main.bar.color = "grey10",
+      shade.color = "grey70",
+      sets.x.label = "",
+      mainbar.y.label = "Number of Proteins",
+      text.scale = 1.4
+      )
+
+lm_three_contrasts <- lm_upset %>%
+  filter(Sums == 3) %>%
+  select(Protein) %>%
+  separate(Protein, into = c("Protein_name", NA)) %>%
+  pull(Protein_name)
+```
+
+### Volcano plots
+```{r}
+to_vp <- Dx_res %>%
+  unite("contrast", term, versus , sep = "_", remove = FALSE) %>%
+  # select(Protein, estimate, padj) %>%
+  mutate(log_padj = -log10(padj))
+
+vp_down <- to_vp %>%
+  filter(padj < 0.05) %>%
+  filter(estimate < 0)
+vp_up <- to_vp %>%
+  filter(padj < 0.05) %>%
+  filter(estimate > 0)
+
+Dx_res_sig_NPH <- Dx_res_sig %>%
+  filter(Contrast == "NPH_AD" | Contrast == "NPH_CU") %>%
+  separate(Protein, into = c("Protein_name", "UniprotID"), sep = "_")
+
+ggplot(to_vp, aes(x = estimate, y = log_padj))+
+  geom_point(aes(color = (padj < 0.05)))+
+  scale_color_manual(values = c("grey", "blue")) +
+  facet_wrap(~contrast)+
+  geom_hline(aes(yintercept = 1.30103), linetype = "dashed") +
+  labs(x = "Estimate", y = "-log10(p-value)", title = "Differentially expressed proteins") 
+```
+
+# Full sample decision tree
+```{r}
+# Create a decision tree model specification
+tree_spec <- decision_tree() %>%
+ set_engine("rpart") %>%
+ set_mode("classification")
+
+## Tree of all three classes
+all_classes_to_tree <- protein_data_DEM_Apos %>%
+  select(Pathology_group, Gender_binary, Age, c(6:ncol(protein_data_DEM_Apos))) %>%
+  mutate(Pathology_group = droplevels(as.factor(Pathology_group)))
+
+tree_fit_all <- rpart(Pathology_group ~ ., data = all_classes_to_tree, control = rpart.control(maxdepth = 7))
+rpart.plot(tree_fit_all, type = 4, extra = 101, under = TRUE, cex = 0.6, box.palette = list("CU" = "#fee090", "AD" = "#4575b4", "NPH" = "#d73027"), roundint = FALSE)
+```
+
+# Random Forest models
+```{r}
+CU_AD <- protein_data_DEM_Apos %>%
+  filter(Pathology_group == "CU" | Pathology_group == "AD") %>%
+  select(Pathology_group, Gender_binary, Age, c(6:ncol(protein_data_DEM_Apos))) %>%
+  mutate(Pathology_group = droplevels(as.factor(Pathology_group)))
+
+CU_NPH <- protein_data_DEM_Apos %>%
+  filter(Pathology_group == "CU" | Pathology_group == "NPH") %>%
+  select(Pathology_group, Gender_binary, Age, c(6:ncol(protein_data_DEM_Apos))) %>%
+  mutate(Pathology_group = droplevels(as.factor(Pathology_group)))
+
+AD_NPH <- protein_data_DEM_Apos %>%
+  filter(Pathology_group == "AD" | Pathology_group == "NPH") %>%
+  select(Pathology_group, Gender_binary, Age, c(6:ncol(protein_data_DEM_Apos))) %>%
+  mutate(Pathology_group = droplevels(as.factor(Pathology_group)))
+```
+
+### Define the tuning grids for each comparison
+```{r}
+myGrid_CU_AD <- data.frame(.mtry = seq(from = 1, to = ncol(CU_AD)-1, by = 20),
+                     .splitrule = "gini",
+                     .min.node.size = 1)
+
+myGrid_CU_NPH <- data.frame(.mtry = seq(from = 1, to = ncol(CU_NPH)-1, by = 20),
+                     .splitrule = "gini",
+                     .min.node.size = 1)
+
+myGrid_AD_NPH <- data.frame(.mtry = seq(from = 1, to = ncol(AD_NPH)-1, by = 20),
+                     .splitrule = "gini",
+                     .min.node.size = 1)
+```
+
+### 10-fold cross validation repeated 5 times
+```{r}
+set.seed(42)
+# CU vs AD
+model_CU_AD <- train(
+  Pathology_group ~ .,
+  CU_AD,
+  method = "ranger",
+  tuneGrid = myGrid_CU_AD,
+  importance = "impurity",
+  trControl = trainControl(
+    method = "repeatedcv",
+    number = 10,
+    repeats = 5,
+    verboseIter = TRUE
+  )
+)
+
+# CU vs NPH
+model_CU_NPH <- train(
+  Pathology_group ~ .,
+  CU_NPH,
+  method = "ranger",
+  tuneGrid = myGrid_CU_NPH,
+  importance = "impurity",
+  trControl = trainControl(
+    method = "repeatedcv",
+    number = 10,
+    repeats = 5,
+    verboseIter = TRUE
+  )
+)
+
+# AD vs NPH
+model_AD_NPH <- train(
+  Pathology_group ~ .,
+  AD_NPH,
+  method = "ranger",
+  tuneGrid = myGrid_AD_NPH,
+  importance = "impurity",
+  trControl = trainControl(
+    method = "repeatedcv",
+    number = 10,
+    repeats = 5,
+    verboseIter = TRUE
+  )
+)
+```
+
+### Top features of models
+```{r}
+importance_CU_AD <- as.data.frame(model_CU_AD[["finalModel"]]$variable.importance)
+importance_CU_NPH <- as.data.frame(model_CU_NPH[["finalModel"]]$variable.importance)
+importance_AD_NPH <- as.data.frame(model_AD_NPH[["finalModel"]]$variable.importance)
+
+variable_importance <- data.frame(
+  Features = rownames(importance_CU_NPH),
+  CU_AD = importance_CU_AD$`model_CU_AD[["finalModel"]]$variable.importance`,
+  CU_NPH = importance_CU_NPH$`model_CU_NPH[["finalModel"]]$variable.importance`,
+  AD_NPH = importance_AD_NPH$`model_AD_NPH[["finalModel"]]$variable.importance`) %>%
+  separate(Features, into = c("Gene_Name", "UniprotID"), sep = "_", remove = FALSE) %>%
+  separate(Gene_Name, into = c("Razor_Protein", NA), sep = "\\.") %>%
+  group_by(Razor_Protein) %>% 
+  summarise(CU_AD = max(CU_AD), CU_NPH = max(CU_NPH), AD_NPH = max(AD_NPH)) %>%
+  filter(!(Razor_Protein) %in% as.character(c(1:80)))
+```
+
+### Top features per contrast
+```{r}
+top_features_CU_AD <- variable_importance %>%
+  select(Razor_Protein, CU_AD) %>%
+  arrange(desc(CU_AD)) %>%
+  filter(Razor_Protein != "Age" & Razor_Protein != "Gender") %>%
+  slice(1:30)
+top_features_CU_AD$Razor_Protein <- factor(top_features_CU_AD$Razor_Protein, levels = top_features_CU_AD$Razor_Protein[order(-top_features_CU_AD$CU_AD)])
+
+CU_AD_features <- ggplot(top_features_CU_AD, aes(x= CU_AD, y = reorder(Razor_Protein, CU_AD))) +
+  geom_bar(stat = "identity", position = "dodge", fill = "#646469") +
+  labs(title = "CU vs AD", y = "Protein", x = "Gini importance") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  theme_bw()
+CU_AD_features
+
+top_features_AD_NPH <- variable_importance %>%
+  select(Razor_Protein, AD_NPH) %>%
+  arrange(desc(AD_NPH)) %>%
+  filter(Razor_Protein != "Age" & Razor_Protein != "Gender") %>%
+  slice(1:30)
+top_features_AD_NPH$Razor_Protein <- factor(top_features_AD_NPH$Razor_Protein, levels = top_features_AD_NPH$Razor_Protein[order(-top_features_AD_NPH$AD_NPH)])
+
+AD_NPH_features <- ggplot(top_features_AD_NPH, aes(x= AD_NPH, y = reorder(Razor_Protein, AD_NPH))) +
+  geom_bar(stat = "identity", position = "dodge", fill = "#646469") +
+  labs(title = "AD vs NPH", y = "Protein", x = "Gini importance") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  theme_bw()
+AD_NPH_features
+
+top_features_CU_NPH <- variable_importance %>%
+  select(Razor_Protein, CU_NPH) %>%
+  arrange(desc(CU_NPH)) %>%
+  filter(Razor_Protein != "Age" & Razor_Protein != "Gender") %>%
+  slice(1:30)
+top_features_CU_NPH$Razor_Protein <- factor(top_features_CU_NPH$Razor_Protein, levels = top_features_CU_NPH$Razor_Protein[order(-top_features_CU_NPH$CU_NPH)])
+
+CU_NPH_features <- ggplot(top_features_CU_NPH, aes(x= CU_NPH, y = reorder(Razor_Protein, CU_NPH))) +
+  geom_bar(stat = "identity", position = "dodge", fill = "#646469") +
+  labs(title = "CU vs NPH", y = "Protein", x = "Gini importance") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  theme_bw()
+CU_NPH_features
+
+features_plot <- plot_grid(CU_AD_features, AD_NPH_features, CU_NPH_features, ncol = 3, align = "v")
+features_plot
+```
+
+### Upset plot of top features
+```{r}
+Top_features_protein_names <- data.frame(CU_AD = top_features_CU_AD$Razor_Protein,
+                                         AD_NPH = top_features_AD_NPH$Razor_Protein,
+                                         CU_NPH = top_features_CU_NPH$Razor_Protein)
+```
+
+```{r}
+upset_top_features_df <- data.frame(Proteins = unique(as.vector(as.matrix(Top_features_protein_names)))) %>%
+  mutate(CU_AD = ifelse(Proteins %in% Top_features_protein_names$CU_AD, 1, 0)) %>%
+  mutate(CU_NPH = ifelse(Proteins %in% Top_features_protein_names$CU_NPH, 1, 0)) %>%
+  mutate(AD_NPH = ifelse(Proteins %in% Top_features_protein_names$AD_NPH, 1, 0))
+
+upset(upset_top_features_df,
+      order.by = "freq",
+      text.scale = 1.4)
+
+NPH_spec_top_proteins <- upset_top_features_df %>%
+  filter(CU_NPH == 1 & AD_NPH == 1) %>%
+  select(Proteins)
+CU_spec_top_proteins <- upset_top_features_df %>%
+  filter(CU_AD == 1 & CU_NPH == 1) %>%
+  select(Proteins)
+AD_spec_top_proteins <- upset_top_features_df %>%
+  filter(CU_AD == 1 & AD_NPH == 1) %>%
+  select(Proteins)
+
+overlappers <- upset_top_features_df %>%
+  mutate(sums = CU_AD + AD_NPH + CU_NPH) %>%
+  filter(sums > 1)
+```
+
+
+### Heatmap of upset proteins
+```{r}
+heatmap_top_features <- protein_data_DEM_Apos %>%
+  select(Participant, Pathology_group, c(6:ncol(protein_data_DEM_Apos))) %>%
+  pivot_longer(3:ncol(.), names_to = "Protein_ID", values_to = "Abundance") %>%
+  separate(Protein_ID, into = c("Protein_name", "Uniprot_ID"), sep = "_", remove = FALSE) %>%
+  filter(Protein_name %in% upset_top_features_df$Proteins) %>%
+  {df_top_proteins <<- .} %>%
+  select(-c(Protein_ID, Uniprot_ID)) %>%
+  unique() %>%
+  group_by(Participant, Pathology_group, Protein_name) %>%
+  dplyr::summarise(Abundance = mean(Abundance)) %>%
+  pivot_wider(names_from = Protein_name, values_from = Abundance) %>%
+  column_to_rownames("Participant")
+
+heatmap_top_features_arranged <- arrange(heatmap_top_features, Pathology_group)
+
+color <- list(Pathology_group = c("CU" = "#fee090", "AD" = "#4575b4", "NPH" = "#d73027"))
+ha <- HeatmapAnnotation(Pathology_group = heatmap_top_features_arranged$Pathology_group, col = color)
+heatmap <- Heatmap(t(heatmap_top_features_arranged[,2:ncol(heatmap_top_features_arranged)]),
+        cluster_columns = TRUE,  # Enables clustering for columns
+        cluster_rows = TRUE,    # Enables clustering for rows
+        show_row_names = TRUE,  # Hides row names
+        show_column_names = FALSE,  # Shows column names
+        col = bluered(100),     # Sets the color palette
+        top_annotation = ha,
+        row_names_gp = gpar(fontsize = 10))
+heatmap
+```
+
+### Boxplots of all top proteins
+```{r}
+top_features_boxplots <- heatmap_top_features_arranged %>%
+  rownames_to_column("Participant") %>%
+  pivot_longer(-c(Participant, Pathology_group), names_to = "Protein_ID", values_to = "Abundance") %>%
+  separate(Protein_ID, into = c("Gene_symbol", "UniprotID"), sep = "_") %>%
+  group_by(Participant, Pathology_group, Gene_symbol) %>%
+  dplyr::summarise(Abundance = mean(Abundance)) %>%
+  mutate(Pathology_group = factor(Pathology_group, levels = c("CU", "AD", "NPH"))) %>%
+  mutate(Gene_symbol = factor(Gene_symbol, levels = c("BASP1", "MDH1", "GOT1", "PKM", "PGLYRP2", "F5", "LTBP2", "KIAA1549L", "VGF", "NPTXR", "NRXN3", "PTPRN2"))) %>%
+  filter(!is.na(Gene_symbol))
+
+color <- c("AD" = "#4575b4", "NPH" = "#d73027", "CU" = "#fee090")
+ggplot(top_features_boxplots, aes(x = Pathology_group, y = Abundance, fill = Pathology_group)) +
+  geom_boxplot() +
+  scale_fill_manual(values = color) +
+  facet_wrap(~Gene_symbol, ncol = 6)+
+  labs(x = "Group") +
+  theme_bw() +
+  theme(strip.text = element_text(size=10))
+```
+
+# ROC curves top proteins
+### AD vs NPH
+```{r}
+toROC_AD_NPH <- protein_data_DEM_Apos %>%
+  select(Pathology_group,BASP1_P80723,MDH1_P40925, GOT1_P17174, PKM_P14618, PGLYRP2_Q96PD5, F5_P12259) %>%
+  filter(Pathology_group != "CU") %>%
+  mutate(Pathology_group = ifelse(Pathology_group == "NPH", 1, 0))
+
+# One simple ROC
+roc_BASP1 <- roc(toROC_AD_NPH$Pathology_group, toROC_AD_NPH$BASP1_P80723)
+roc_MDH1 <- roc(toROC_AD_NPH$Pathology_group, toROC_AD_NPH$MDH1_P40925)
+roc_GOT1 <- roc(toROC_AD_NPH$Pathology_group, toROC_AD_NPH$GOT1_P17174)
+roc_PKM <- roc(toROC_AD_NPH$Pathology_group, toROC_AD_NPH$PKM_P14618)
+roc_PGLYRP2 <- roc(toROC_AD_NPH$Pathology_group, toROC_AD_NPH$PGLYRP2_Q96PD5)
+roc_F5 <- roc(toROC_AD_NPH$Pathology_group, toROC_AD_NPH$F5_P12259)
+
+# Using the glm to create composite score across all top proteins
+model <- glm(Pathology_group ~ ., data = toROC_AD_NPH, family = "binomial")
+toROC_AD_NPH$glm_res <- predict(model, type = "response")
+
+glm_roc_object_AD_NPH <- roc(toROC_AD_NPH$Pathology_group, toROC_AD_NPH$glm_res)
+auc(glm_roc_object_AD_NPH)
+
+# combine results
+roc_results <- list(roc_BASP1, roc_MDH1, roc_GOT1, roc_PKM, roc_PGLYRP2, roc_F5, glm_roc_object_AD_NPH)
+names(roc_results) <- c("BASP1", "MDH1", "GOT1", "PKM", "PGLYRP2", "F5", "Composite")
+
+# plot
+ggroc(roc_results) +
+  geom_segment(aes(x = 0, xend = 1, y = 1, yend = 0), linetype = "dashed", color = "darkgrey") +
+  scale_color_manual(values = c("BASP1" = "red", "MDH1" = "green", "GOT1" = "blue", "PKM" = "orange", 
+                                 "PGLYRP2" = "purple", "F5" = "brown", "Composite" = "black")) +
+  theme_bw() +
+  ggtitle("AD vs NPH")
+```
+
+### CU vs NPH
+```{r}
+toROC_CU_NPH <- protein_data_DEM_Apos %>%
+  select(Pathology_group,LTBP2_Q14767,KIAA1549L_H0YDE5, VGF_O15240, NPTXR_O95502, NRXN3_Q9Y4C0, PTPRN2_Q92932) %>%
+  filter(Pathology_group != "AD") %>%
+  mutate(Pathology_group = ifelse(Pathology_group == "NPH", 1, 0))
+
+# One simple ROC
+roc_LTBP2 <- roc(toROC_CU_NPH$Pathology_group, toROC_CU_NPH$LTBP2_Q14767)
+roc_KIAA1549 <- roc(toROC_CU_NPH$Pathology_group, toROC_CU_NPH$KIAA1549L_H0YDE5)
+roc_VGF <- roc(toROC_CU_NPH$Pathology_group, toROC_CU_NPH$VGF_O15240)
+roc_NPTXR <- roc(toROC_CU_NPH$Pathology_group, toROC_CU_NPH$NPTXR_O95502)
+roc_NRXN3 <- roc(toROC_CU_NPH$Pathology_group, toROC_CU_NPH$NRXN3_Q9Y4C0)
+roc_PTPRN2 <- roc(toROC_CU_NPH$Pathology_group, toROC_CU_NPH$PTPRN2_Q92932)
+
+# Using the glm to create composite score across all top proteins
+model <- glm(Pathology_group ~ ., data = toROC_CU_NPH, family = "binomial")
+toROC_CU_NPH$glm_res <- predict(model, type = "response")
+
+glm_roc_object_CU_NPH <- roc(toROC_CU_NPH$Pathology_group, toROC_CU_NPH$glm_res)
+auc(glm_roc_object_CU_NPH)
+
+# combine results
+roc_results <- list(roc_LTBP2, roc_KIAA1549, roc_VGF, roc_NPTXR, roc_NRXN3, roc_PTPRN2, glm_roc_object_CU_NPH)
+names(roc_results) <- c("LTBP2", "KIAA1549", "VGF", "NPTXR", "NRXN3", "PTPRN2", "Composite")
+
+# plot
+ggroc(roc_results) +
+  geom_segment(aes(x = 0, xend = 1, y = 1, yend = 0), linetype = "dashed", color = "darkgrey") +
+  scale_color_manual(values = c("LTBP2" = "red", "KIAA1549" = "green", "VGF" = "blue", "NPTXR" = "orange", 
+                                 "NRXN3" = "purple", "PTPRN2" = "brown", "Composite" = "black")) +
+  theme_bw() +
+  ggtitle("CU vs NPH")
+```
+
+### CU vs AD
+```{r}
+toROC_CU_AD <- protein_data_DEM_Apos %>%
+  select(Pathology_group,SMOC1_Q9H4F8,PGK1_P00558, LDHA_P00338, ENO1_P06733, CALM1.CALM2.CALM3_P0DP23.P0DP24.P0DP25, ALDOA_P04075) %>%
+  filter(Pathology_group != "NPH") %>%
+  mutate(Pathology_group = ifelse(Pathology_group == "AD", 1, 0))
+
+# One simple ROC
+roc_SMOC1 <- roc(toROC_CU_AD$Pathology_group, toROC_CU_AD$SMOC1_Q9H4F8)
+roc_PGK1 <- roc(toROC_CU_AD$Pathology_group, toROC_CU_AD$PGK1_P00558)
+roc_LDHA <- roc(toROC_CU_AD$Pathology_group, toROC_CU_AD$LDHA_P00338)
+roc_ENO1 <- roc(toROC_CU_AD$Pathology_group, toROC_CU_AD$ENO1_P06733)
+roc_CALM1 <- roc(toROC_CU_AD$Pathology_group, toROC_CU_AD$CALM1.CALM2.CALM3_P0DP23.P0DP24.P0DP25)
+roc_ALDOA <- roc(toROC_CU_AD$Pathology_group, toROC_CU_AD$ALDOA_P04075)
+
+# Using the glm to create composite score across all top proteins
+model <- glm(Pathology_group ~ ., data = toROC_CU_AD, family = "binomial")
+toROC_CU_AD$glm_res <- predict(model, type = "response")
+
+glm_roc_object_CU_AD <- roc(toROC_CU_AD$Pathology_group, toROC_CU_AD$glm_res)
+auc(glm_roc_object_CU_AD)
+
+# combine results
+roc_results <- list(roc_SMOC1, roc_PGK1, roc_LDHA, roc_ENO1, roc_CALM1, roc_ALDOA, glm_roc_object_CU_AD)
+names(roc_results) <- c("SMOC1", "PGK1", "LDHA", "ENO1", "CALM1", "ALDOA", "Composite")
+
+# plot
+ggroc(roc_results) +
+  geom_segment(aes(x = 0, xend = 1, y = 1, yend = 0), linetype = "dashed", color = "darkgrey") +
+  scale_color_manual(values = c("SMOC1" = "red", "PGK1" = "green", "LDHA" = "blue", "ENO1" = "orange", 
+                                 "CALM1" = "purple", "ALDOA" = "brown", "Composite" = "black")) +
+  theme_bw() +
+  ggtitle("CU vs AD")
+```
+

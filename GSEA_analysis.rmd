@@ -1,0 +1,243 @@
+---
+title: "GSEA"
+author: "Matthijs de Geus"
+output:
+  html_document:
+    toc: yes
+    toc_float: yes
+    code_folding: show
+  '': default
+---
+
+### Load data and dependencies
+```{r}
+library(tidyverse)
+library(janitor)
+library(gplots)
+protein_data <- read.csv("protein_data.csv")
+string_db_res <- read.csv("lm_GSEA_results_combined.csv")
+```
+
+### restructuring protein data df
+Columns for each pathology diagnosis with the average abundance for each protein. Then add columns for each contrast.
+```{r}
+fold_change_data <- protein_data_DEM_Apos %>%
+  select(Pathology_group, c(55:ncol(protein_data_DEM_Apos))) %>%
+  group_by(Pathology_group) %>%
+  summarise(across(everything(), mean)) %>%
+  t() %>%
+  as.data.frame() %>%
+  row_to_names(row_number = 1) %>%
+  rownames_to_column("Protein") %>%
+  {. ->> avg_protein_levels_pathology} %>%
+  mutate(AD_vs_CU = (as.numeric(AD)-as.numeric(CU)),
+         AD_vs_NPH = (as.numeric(AD)-as.numeric(NPH)),
+         CU_vs_NPH = (as.numeric(CU)-as.numeric(NPH))) %>%
+  select(Protein, AD_vs_CU, AD_vs_NPH, CU_vs_NPH) %>%
+  separate(Protein, into = c("Protein_name", "UniprotID"), sep = "_") %>%
+  separate(UniprotID, into = c("UniprotID", NA), sep = "\\.")
+```
+
+
+# Upset plot of gene sets
+#### Create the Upset data frame
+```{r}
+CU_AD_pathways <- string_db_res %>%
+  filter(Contrast == "CU_AD") 
+  
+AD_NPH_pathways <- string_db_res %>%
+  filter(Contrast == "AD_NPH")
+  
+CU_NPH_pathways <- string_db_res %>%
+  filter(Contrast == "CU_NPH") 
+
+upset_df <- data.frame(Pathways = c(as.vector(unique(string_db_res$term.description)))) %>% 
+  mutate(`CU vs AD` = ifelse(Pathways %in% CU_AD_pathways$term.description, 1, 0)) %>%
+  mutate(`AD vs NPH` = ifelse(Pathways %in% AD_NPH_pathways$term.description, 1, 0)) %>%
+  mutate(`CU vs NPH` = ifelse(Pathways %in% CU_NPH_pathways$term.description, 1, 0)) %>%
+  column_to_rownames(var = "Pathways") %>%
+  mutate(sums = rowSums(.[1:3]))
+```
+
+#### Upset plot
+```{r}
+UpSetR::upset(upset_df, 
+              order.by = c("degree"),
+              # group.by = "degree",
+              decreasing = FALSE,
+              # intersections = intersections_list,
+              matrix.color = "grey20",
+              main.bar.color = "grey10",
+              shade.color = "grey70",
+              sets.x.label = "",
+              # number.angles = 45,
+              mainbar.y.label = "Number of Pathways",
+              text.scale = 1.4
+              )
+```
+
+
+## Extracting the proteins for heatmap
+```{r}
+selected_pathways <- string_db_res %>%
+  filter(term.description %in% rownames(upset_df)) %>%
+  select(term.description, matching.proteins.in.your.input..labels.) %>%
+  separate_rows(matching.proteins.in.your.input..labels., sep = ",") %>%
+  rename("Protein_name" = matching.proteins.in.your.input..labels.)
+
+protein_data_long <- protein_data_DEM_Apos %>%
+  pivot_longer(-c(1:55), names_to = "Protein_ID", values_to = "Abundance") %>%
+  separate(Protein_ID, into = c("Protein_name", "UniprotID"), sep = "_", remove = FALSE) %>%
+  separate(Protein_name, into = c("Protein_name", NA), sep = "\\.")
+
+grouped_protein_data_long <- protein_data_long %>%
+  group_by(Participant, Pathology_group, Age, Protein_name) %>%
+  summarise(Goup_abundance_max = mean(Abundance)) %>%
+  filter(Protein_name %in% selected_pathways$Protein_name) %>%
+  filter(Pathology_group != "Other")
+
+merged_df <- merge(selected_pathways, grouped_protein_data_long) %>%
+  group_by(Participant, Pathology_group, term.description) %>%
+  summarise(pathway_abundance = mean(Goup_abundance_max))
+```
+
+#### proteins to highlight in heatmap for specific pathways
+```{r}
+glucose_module <- c("Glycolytic process",
+                    "Generation of precursor metabolites and energy",
+                    "Nucleobase-containing small molecule metabolic process",
+                    "Nucleotide metabolic process",
+                    "Purine ribonucleotide metabolic process",
+                    "Small molecule catabolic process")
+glucose_module_proteins <- selected_pathways %>%
+  filter(term.description %in% glucose_module) 
+
+axon_module <- c("Axon guidance",
+                 "Axonogenesis",
+                 "Cell morphogenesis involved in neuron differentiation",
+                 "Cell projection morphogenesis",
+                 "Neuron projection morphogenesis",
+                 "Cellular component morphogenesis")
+
+axon_module_2 <- c("Axon development",
+                 "Plasma membrane bounded cell projection organization",
+                 "Neuron projectino development",
+                 "Neuron development",
+                 "Generation of neurons",
+                 "Neuron differentiation")
+
+axon_module_proteins <- selected_pathways %>%
+  filter(term.description %in% axon_module_2 | term.description %in% axon_module) 
+axon_module_prot_count <- as.data.frame(table(axon_module_proteins$Protein_name)) %>%
+  filter(Freq > 30)
+
+complement_module <- c("Complement activation, classical pathway",
+                       "Immunoglobulin mediated immune response",
+                       "Complement activation")
+complement_module_proteins <- selected_pathways %>% filter(term.description %in% complement_module)
+complement_module_prot_count <- as.data.frame(table(complement_module_proteins$Protein_name)) %>%
+  filter(Freq > 3)
+
+
+vascular_module <- c("Negative regulation of wound healing",
+                     "Negative regulation of coagulation",
+                     "Negative regulation of blood coagulation",
+                     "Regulation of blood coagulation")
+vascular_module_proteins <- selected_pathways %>% filter(term.description %in% vascular_module)
+vascular_module_prot_count <- as.data.frame(table(vascular_module_proteins$Protein_name)) %>%
+  filter(Freq > 3)
+```
+
+
+## Now plot the heatmap of the abundances
+```{r}
+## Make the heatmap matrices
+## CU AD heatmap
+CU_AD_heatmap <- merged_df %>%
+  filter(Pathology_group == "AD" | Pathology_group == "CU") %>%
+  filter(term.description %in% CU_AD_pathways$term.description) %>%
+  pivot_wider(names_from = term.description, values_from = pathway_abundance) %>%
+  column_to_rownames("Participant")
+
+## AD NPH heatmap
+AD_NPH_heatmap <- merged_df %>%
+  filter(Pathology_group == "AD" | Pathology_group == "NPH") %>%
+  filter(term.description %in% AD_NPH_pathways$term.description) %>%
+  pivot_wider(names_from = term.description, values_from = pathway_abundance) %>%
+  column_to_rownames("Participant") 
+
+## CU NPH heatmap
+CU_NPH_heatmap <- merged_df %>%
+  filter(Pathology_group == "NPH" | Pathology_group == "CU") %>%
+  filter(term.description %in% CU_NPH_pathways$term.description) %>%
+  pivot_wider(names_from = term.description, values_from = pathway_abundance) %>%
+  column_to_rownames("Participant")
+
+## Make the heatmaps
+color <- list(Pathology_group = c("CU" = "#fee090", "AD" = "#4575b4"))
+ha <- HeatmapAnnotation(Pathology_group = CU_AD_heatmap$Pathology_group, col = color)
+heatmap_CU_AD <- Heatmap(t(CU_AD_heatmap[,2:ncol(CU_AD_heatmap)]),
+        cluster_columns = TRUE,  # Enables clustering for columns
+        cluster_rows = TRUE,    # Enables clustering for rows
+        show_row_names = TRUE,  # Hides row names
+        show_column_names = FALSE,  # Shows column names
+        col = bluered(100),     # Sets the color palette
+        top_annotation = ha,
+        row_names_gp = gpar(fontsize = 7)
+)
+draw(heatmap_CU_AD)
+
+color <- list(Pathology_group = c("CU" = "#fee090", "NPH" = "#d73027"))
+ha <- HeatmapAnnotation(Pathology_group = CU_NPH_heatmap$Pathology_group, col = color)
+heatmap_CU_NPH <- Heatmap(t(CU_NPH_heatmap[,2:ncol(CU_NPH_heatmap)]),
+        cluster_columns = TRUE,  # Enables clustering for columns
+        cluster_rows = TRUE,    # Enables clustering for rows
+        show_row_names = TRUE,  # Hides row names
+        show_column_names = FALSE,  # Shows column names
+        col = bluered(100),     # Sets the color palette
+        top_annotation = ha,
+        row_names_gp = gpar(fontsize = 7)
+)
+draw(heatmap_CU_NPH)
+
+
+color <- list(Pathology_group = c("AD" = "#4575b4", "NPH" = "#d73027"))
+ha <- HeatmapAnnotation(Pathology_group = AD_NPH_heatmap$Pathology_group, col = color)
+heatmap_AD_NPH <- Heatmap(t(AD_NPH_heatmap[,2:ncol(AD_NPH_heatmap)]),
+        cluster_columns = TRUE,  # Enables clustering for columns
+        cluster_rows = TRUE,    # Enables clustering for rows
+        show_row_names = TRUE,  # Hides row names
+        show_column_names = FALSE,  # Shows column names
+        col = bluered(100),     # Sets the color palette
+        top_annotation = ha,
+        row_names_gp = gpar(fontsize = 7)
+)
+draw(heatmap_AD_NPH)
+```
+
+Heatmap of overlapping pathways only
+```{r}
+three_pathways <- upset_df %>%
+  filter(sums > 1)
+
+Overlapping_pathways <- merged_df %>%
+  filter(term.description %in% rownames(three_pathways))
+
+Overlapping_pathways_heatmap <- Overlapping_pathways %>%
+  pivot_wider(names_from = term.description, values_from = pathway_abundance) %>%
+  column_to_rownames("Participant")
+
+color <- list(Pathology_group = c("CU" = "#fee090", "NPH" = "#d73027", "AD" = "#4575b4"))
+ha <- HeatmapAnnotation(Pathology_group = Overlapping_pathways_heatmap$Pathology_group, col = color)
+
+Pathways_overlap_heatmap <- Heatmap(t(Overlapping_pathways_heatmap[,2:ncol(Overlapping_pathways_heatmap)]),
+        cluster_columns = TRUE,  # Enables clustering for columns
+        cluster_rows = TRUE,    # Enables clustering for rows
+        show_row_names = TRUE,  # Hides row names
+        show_column_names = FALSE,  # Shows column names
+        col = bluered(100),     # Sets the color palette
+        top_annotation = ha,
+        row_names_gp = gpar(fontsize = 6)
+)
+draw(Pathways_overlap_heatmap)
+```

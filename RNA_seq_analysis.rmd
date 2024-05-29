@@ -1,0 +1,109 @@
+---
+title: "RNA-seq data merged with CSF proteomics"
+author: "Matthijs de Geus"
+output:
+  html_document:
+    toc: yes
+    toc_float: yes
+    code_folding: show
+  '': default
+---
+
+
+```{r}
+library(tidyverse)
+library(readxl)
+library(ComplexHeatmap)
+library(circlize)
+library(matrixStats)
+
+## linear model output
+lm_upset <- read.csv("lm_upset.csv")
+lm_output <- lm_upset %>%
+  separate(Protein, into = c("Protein", "UniprotID"), sep = "_") %>%
+  select(Protein) %>%
+  separate(Protein, into = c("Protein", NA), sep = "\\.")
+### RNA-seq tables
+medians_df <- read.csv("medians.csv") %>%
+  filter(feature %in% lm_output$Protein)
+
+top_features <- read.csv("upset_top_features_df.csv") %>% select(-1)
+
+# Metadata from Hodge et al 
+gene_list_cell_type <- read_xlsx("Hodge_etal_Supptable_5.xlsx")
+cell_type_metadata <- read_xlsx("Hodge_etal_Supptable_2.xlsx")
+```
+
+Merge RNA-seq data and select necessary columns
+```{r}
+gene_list_selected <- gene_list_cell_type %>%
+  select(c(1:6)) %>%
+  rename(cluster = fpkm_max_cluster) %>%
+  filter(gene %in% lm_output$Protein)
+cell_type_selected <- cell_type_metadata %>%
+  select(cluster, level1)
+
+tissue_info <- merge(cell_type_selected, gene_list_selected)
+```
+
+Use the medians_df to look at expression of our proteins across the different cell-types
+```{r}
+mean_prot_scores <- medians_df %>%
+  select(-X) %>%
+  mutate(overall_mean = rowMeans(.[,2:77])) %>%
+  select(c(1,overall_mean)) %>%
+  column_to_rownames("feature")
+
+medians_df_normalized <- medians_df %>%
+  select(-X) %>%
+  column_to_rownames("feature") %>%
+  mutate(across(everything(), ~ ./mean_prot_scores$overall_mean)) %>%
+  mutate(across(everything(), ~ replace(., is.na(.), 0))) %>%
+  mutate(across(everything(), ~ log10(.+1)))
+
+medians_long <- medians_df_normalized %>%
+  rownames_to_column("Protein") %>% 
+  pivot_longer(-Protein, names_to = "cell_cluster", values_to = "median_abundance") %>%
+  separate(cell_cluster, into = c("cell_type", NA), remove = FALSE) %>%
+  mutate(across(everything(), ~replace(., is.infinite(.), 0)))
+
+medians_all_heatmap <- medians_df_normalized %>%
+  select(sort(colnames(.))) %>%
+  t() 
+```
+
+## Heatmap collapsed across all celltypes
+```{r}
+collapsed_df <- medians_long %>%
+  group_by(Protein, cell_type) %>%
+  reframe(Abundance = mean(median_abundance)) %>%
+  pivot_wider(names_from = Protein, values_from = Abundance) %>%
+  column_to_rownames("cell_type") %>%
+  select(where(~ !all(. == 0))) 
+
+prots_to_show <- as.data.frame(t(collapsed_df)) %>%
+  mutate(max_enrichment = rowMaxs(as.matrix(.))) %>%
+  filter(max_enrichment >= 0.30103)
+
+to_celltype_hm <- collapsed_df %>%
+  select(rownames(prots_to_show)) %>%
+  as.matrix()
+
+color_gradient = colorRamp2(c(0, max(collapsed_df, na.rm = TRUE)), c("white", "red"))
+
+collapsed_hm <- Heatmap(t(collapsed_df),
+        cluster_columns = TRUE,  # Enables clustering for columns
+        cluster_rows = TRUE,    # Enables clustering for rows
+        show_row_names = TRUE,  # Hides row names
+        show_column_names = TRUE,  # Shows column names
+        col = color_gradient,
+        border = "grey50",
+        rect_gp = grid::gpar(col = "grey100", lwd = 0.25),
+        row_names_gp = gpar(fontsize = 4),
+        column_names_gp = gpar(fontsize = 9)
+)
+
+draw(collapsed_hm)
+```
+
+
