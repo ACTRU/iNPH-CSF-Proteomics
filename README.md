@@ -22,7 +22,7 @@ This repository contains data and analysis related to the proteomics study of ce
 
 If you use this repository in your work, please cite the following publication:
 
-[Publication details here]
+[Manuscript currently in press]
 
 ## Terms and Conditions
 
